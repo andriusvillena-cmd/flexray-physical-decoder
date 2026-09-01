@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+flexray.png
+flexray_sintetica.csv
+FlexRay_Trace.csv

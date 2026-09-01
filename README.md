@@ -1,192 +1,188 @@
 # flexray-physical-decoder
 
-Decodifica tramas FlexRay a partir de la señal eléctrica capturada con un
-osciloscopio, y genera señales FlexRay sintéticas para probarlo. Sin librerías
-de FlexRay: todo el protocolo está implementado desde cero, del umbral de
-tensión a los dos polinomios de CRC.
+Decodes FlexRay frames from the electrical signal captured with an oscilloscope,
+and generates synthetic FlexRay signals to test it. No FlexRay library: the whole
+protocol is implemented from scratch, from the voltage threshold to both CRC
+polynomials.
 
 ![tests](https://github.com/andriusvillena-cmd/flexray-physical-decoder/actions/workflows/tests.yml/badge.svg)
 
 ---
 
-## Qué hace
+## What it does
 
-Entrada: un CSV exportado de PicoScope con tres columnas — tiempo y los dos
-hilos del par diferencial en voltios.
-
-```
-python flexray_decode.py FlexRay_Trace.csv
-```
+Input: a PicoScope CSV with three columns — time and the two wires of the
+differential pair, in volts.
 
 ```
-  paso de muestreo    0.0125 us   (80 MS/s)
-  tiempo de bit       100.0 ns
-  velocidad del bus   10.00 Mbit/s
-  muestras por bit    8.0
+python flexray_decode.py my_capture.csv
+```
+
+```
+  sampling step       0.0125 us   (80 MS/s)
+  bit time            100.0 ns
+  bus speed           10.00 Mbit/s
+  samples per bit     8.0
 
   TSS                 11 bits
-  bytes leidos        40
-  fin de trama        FES correcto
+  bytes read          40
+  frame end           FES found
 
-  identificador       1
-  tipo                sincronismo, arranque
-  contador de ciclo   45
-  carga util          16 palabras = 32 bytes
+  identifier          1
+  type                sync, startup
+  cycle counter       45
+  payload             16 words = 32 bytes
 
-  CRC de cabecera     0x0F2 leido / 0x0F2 calculado   CORRECTO
-  CRC de trama        0xA011D3 leido / 0xA011D3 calculado   CORRECTO
-  canal               A   (deducido de la semilla del CRC que cuadra)
+  header CRC          0x0F2 read / 0x0F2 computed   MATCH
+  frame CRC           0xA011D3 read / 0xA011D3 computed   MATCH
+  channel             A   (inferred from the CRC seed that matches)
 ```
 
-Y en sentido contrario:
+And the other way round:
 
 ```
-python flexray_gen.py --id 42 --ciclo 7 --bytes 16 --patron cuenta
+python flexray_gen.py --id 42 --cycle 7 --bytes 16 --pattern count
 ```
 
 ---
 
-## Por qué FlexRay no se decodifica como CAN
+## Why FlexRay is not decoded like CAN
 
-**No hay relleno de bits.** CAN prohíbe más de 5 bits iguales seguidos e
-inserta uno contrario para forzar un flanco. FlexRay hace otra cosa: delante de
-**cada byte** manda dos bits de servicio, uno alto y uno bajo, llamados BSS. El
-flanco de bajada de esos dos bits es un punto de sincronización cada 10 bits.
+**There is no bit stuffing.** CAN forbids more than 5 identical bits in a row
+and inserts an opposite one to force an edge. FlexRay does something else: in
+front of **every byte** it sends two service bits, one high and one low, called
+the Byte Start Sequence. The falling edge of those two bits is a synchronisation
+point every 10 bits.
 
-Eso cambia el diseño del decodificador. En CAN se mide el tiempo de bit una vez
-y se muestrea toda la trama contando desde el bit de arranque. Aquí, si haces
-eso, la deriva te come: a 10 Mbit/s con 8 muestras por bit, un error del 1 % en
-el tiempo de bit desplaza más de medio bit antes de llegar al final. Así que
-este decodificador **se recoloca en cada BSS**, exactamente como el receptor
-real, y por eso funciona incluso con 4 muestras por bit.
+That changes the design of the decoder. In CAN you measure the bit time once and
+sample the whole frame counting from the start bit. Do that here and drift eats
+you: at 10 Mbit/s with 8 samples per bit, a 1% error in the bit time shifts you
+by more than half a bit before the end of the frame. So this decoder
+**realigns on every BSS**, exactly as a real receiver does, and that is why it
+still works with 4 samples per bit.
 
-**Hay dos CRC, no uno.** Uno de 11 bits que protege solo la cabecera, y otro de
-24 que protege cabecera y carga útil. La cabecera va protegida aparte porque un
-nodo tiene que poder fiarse del identificador y de la longitud *antes* de haber
-recibido la trama entera.
+**There are two CRCs, not one.** An 11-bit one covering only the header, and a
+24-bit one covering header and payload. The header is protected separately
+because a node has to be able to trust the identifier and the length *before* it
+has received the whole frame.
 
-**Y el CRC de trama no arranca de cero.** Empieza desde una constante distinta
-según el canal físico: una para el A y otra para el B. Esto tiene una
-consecuencia práctica bonita: si pruebas las dos y solo una cuadra, has
-averiguado de qué canal es la captura sin que nadie te lo diga.
-
----
-
-## Cómo funciona, paso a paso
-
-**1. Diferencial.** Los dos hilos se restan. En reposo están al mismo
-potencial y la diferencia es casi cero; eso permite acotar dónde empieza y
-acaba la trama sin buscar patrones.
-
-**2. Umbral con histéresis.** Dos rayas a ±0,3 V, y entre ellas se conserva el
-estado anterior.
-
-**3. Tiempo de bit.** Se mide de la propia señal, y **no** a partir del hueco
-más corto entre flancos. Con 8 muestras por bit, cada flanco se localiza con un
-error de hasta una muestra, que es el 12 % de un bit, y el mínimo sale corto por
-puro redondeo. Se usa el hueco más *frecuente*, donde el error se reparte a los
-dos lados, y luego se afina exigiendo que todos los huecos duren un número
-entero de bits.
-
-**4. TSS.** La trama abre con una tirada de nivel bajo, de 3 a 15 bits.
-
-**5. Recorrido byte a byte.** FSS, y después, para cada byte: se comprueba el
-BSS, se busca su flanco de bajada real, se ancla ahí y se leen los 8 bits por
-su centro. El anclaje es lo que evita la deriva.
-
-**6. FES.** La trama cierra con un bit bajo seguido de uno alto donde tocaría
-un BSS. El decodificador lo distingue de un error de sincronización.
-
-**7. Cabecera.** 40 bits: reservado, indicador de preámbulo, indicador de trama
-nula, sincronismo, arranque, identificador de 11 bits, longitud de carga útil
-de 7 bits en palabras de 2 bytes, CRC de cabecera de 11 bits, y contador de
-ciclo de 6 bits.
-
-**8. Los dos CRC.** Se recalculan y se comparan con los transmitidos. El de
-cabecera con el polinomio 0x385 desde 0x01A, sobre 20 bits. El de trama con el
-polinomio 0x5D6DCB, sobre la cabecera entera más la carga útil, probando las
-dos semillas de canal.
+**And the frame CRC does not start from zero.** It starts from a different
+constant depending on the physical channel: one for A and another for B. That
+has a neat practical consequence: try both, and if only one matches you have
+worked out which channel the capture came from without anyone telling you.
 
 ---
 
-## Los datos
+## How it works, step by step
 
-**El repositorio no incluye ninguna captura de osciloscopio.**
+**1. Differential.** The two wires are subtracted. While idle they sit at the
+same potential and the difference is close to zero, which makes it possible to
+find where the frame starts and ends without looking for patterns.
 
-El decodificador se desarrolló y se validó contra una captura real de la
-biblioteca de formas de onda de PicoScope: una trama de arranque, canal A,
-identificador 1, ciclo 45, 32 bytes de carga útil a cero, tomada a 80 MS/s. Las
-condiciones de reutilización de esa biblioteca no están publicadas, así que el
-archivo no se redistribuye.
+**2. Threshold with hysteresis.** Two lines at ±0.3 V, and between them the
+previous state is held.
 
-Lo que sí se publica es `flexray_gen.py`, que fabrica señales equivalentes.
-Permite probar el decodificador en cualquier máquina y en condiciones que una
-sola captura no da: distintos identificadores, longitudes de carga útil de 2 a
-254 bytes, los dos canales, velocidades de muestreo más bajas, ruido y
-amplitudes reducidas.
+**3. Bit time.** Measured from the signal itself, and **not** from the shortest
+gap between edges. With 8 samples per bit each edge is located to within one
+sample, which is 12% of a bit, and the minimum comes out short by pure rounding.
+The most *frequent* gap is used instead, where the error falls on both sides,
+and it is then refined by requiring every gap to last a whole number of bits.
 
-Escribir el generador no fue un rodeo. Construir una trama obliga a saber qué va
-en cada bit, y deja el protocolo implementado por los dos lados.
+**4. TSS.** The frame opens with a stretch of low level, between 3 and 15 bits.
 
----
+**5. Byte-by-byte walk.** FSS, and then for each byte: the BSS is checked, its
+real falling edge is located, the decoder anchors there and reads the 8 bits at
+their centres. That anchoring is what prevents drift.
 
-## El círculo cerrado, y cómo se rompe
+**6. FES.** The frame closes with a low bit followed by a high one where a BSS
+would be due. The decoder tells that apart from a synchronisation error.
 
-Probar un decodificador con datos de tu propio generador tiene un riesgo obvio:
-si los dos comparten el mismo malentendido, las pruebas salen verdes y el
-resultado es falso.
+**7. Header.** 40 bits: reserved, payload preamble indicator, null frame
+indicator, sync, startup, 11-bit identifier, 7-bit payload length in two-byte
+words, 11-bit header CRC, and a 6-bit cycle counter.
 
-Por eso hay dos pruebas de **anclaje**, que comparan contra valores medidos en
-la captura real:
-
-- Los 5 bytes de cabecera que produce el generador son `38 01 20 3C AD`.
-- Los dos CRC valen `0x0F2` y `0xA011D3`.
-
-Esos números salieron del osciloscopio antes de que existiera el generador. Si
-alguno de los dos módulos se desvía de la norma, esas pruebas se ponen rojas
-aunque el resto siga cuadrando consigo mismo.
+**8. Both CRCs.** Recomputed and compared with the transmitted ones. The header
+one with polynomial 0x385 from 0x01A, over 20 bits. The frame one with
+polynomial 0x5D6DCB, over the whole header plus the payload, trying both channel
+seeds.
 
 ---
 
-## Pruebas
+## The data
+
+**This repository contains no oscilloscope capture.**
+
+The decoder was developed and validated against a real capture from the
+PicoScope waveform library: a startup frame, channel A, identifier 1, cycle 45,
+32 payload bytes all zero, taken at 80 MS/s. The reuse terms for that library
+are not published, so the file is not redistributed.
+
+What is published is `flexray_gen.py`, which produces equivalent signals. It
+allows the decoder to be tested on any machine, and under conditions a single
+capture cannot provide: different identifiers, payload lengths from 2 to 254
+bytes, both channels, lower sample rates, noise and reduced amplitude.
+
+Writing the generator was not a detour. Building a frame forces you to know what
+goes in every bit, and leaves the protocol implemented from both sides.
+
+---
+
+## The closed circle, and how it is broken
+
+Testing a decoder with data from your own generator has an obvious risk: if the
+two share the same misunderstanding, the tests go green and the result is wrong.
+
+That is why there are two **anchor** tests comparing against values measured on
+the real capture:
+
+- The 5 header bytes the generator produces are `38 01 20 3C AD`.
+- Both CRCs come out as `0x0F2` and `0xA011D3`.
+
+Those numbers came off the oscilloscope before the generator existed. If either
+module drifts from the standard, those tests go red even while everything else
+keeps agreeing with itself.
+
+---
+
+## Tests
 
 ```
 pytest -v
 ```
 
-Dieciocho pruebas. Verde significa que el código funciona.
+Eighteen tests. Green means the code works.
 
-| Grupo | Qué comprueba |
+| Group | What it checks |
 |---|---|
-| Anclaje | Cabecera y los dos CRC iguales a los medidos en la captura real |
-| Capa física | 10 Mbit/s, TSS de 11 y de 5 bits, FES, histéresis, medida del tiempo de bit frente a un hueco anómalo |
-| Robustez | 4 muestras por bit, ruido aumentado, amplitud reducida |
-| Ida y vuelta | Identificadores 1, 42 y 2047; ciclos 0, 7 y 63; cargas de 2, 16 y 254 bytes |
-| Canal | El canal se deduce de la semilla del CRC que cuadra |
-| Detección de fallos | Un bit corrompido en la carga rompe el CRC de trama pero no el de cabecera; uno en la cabecera rompe el suyo |
+| Anchor | Header and both CRCs equal to the ones measured on the real capture |
+| Physical layer | 10 Mbit/s, TSS of 11 and of 5 bits, FES, hysteresis, bit time measurement against an anomalous gap |
+| Robustness | 4 samples per bit, increased noise, reduced amplitude |
+| Round trip | Identifiers 1, 42 and 2047; cycles 0, 7 and 63; payloads of 2, 16 and 254 bytes |
+| Channel | The channel is inferred from the CRC seed that matches |
+| Fault detection | A corrupted bit in the payload breaks the frame CRC but not the header CRC; one in the header breaks its own |
 
-La prueba de 4 muestras por bit es la que más dice: a 40 MS/s cada bit tiene
-cuatro puntos, y el único motivo por el que la trama sigue saliendo entera es la
-resincronización en cada BSS.
+The four-samples-per-bit test is the one that says the most: at 40 MS/s each bit
+gets four points, and the only reason the frame still comes out whole is the
+resynchronisation on every BSS.
 
 ---
 
-## Instalación
+## Installation
 
 ```
 pip install -r requirements.txt
 ```
 
-Python 3.10 o superior. numpy, pandas, matplotlib y pytest.
+Python 3.10 or later. numpy, pandas, matplotlib and pytest.
 
 ---
 
-## Relacionado
+## Related
 
 [can-physical-decoder](https://github.com/andriusvillena-cmd/can-physical-decoder) —
-lo mismo para CAN: de la señal de osciloscopio al mensaje, con verificación de
-CRC y detección de tramas sin acuse de recibo.
+the same for CAN: from the oscilloscope signal to the message, with CRC
+verification and detection of frames nobody acknowledged.
 
-## Normas de referencia
+## Reference standards
 
-ISO 17458-2 (capa de enlace) · ISO 17458-4 (capa física)
+ISO 17458-2 (data link layer) · ISO 17458-4 (physical layer)
